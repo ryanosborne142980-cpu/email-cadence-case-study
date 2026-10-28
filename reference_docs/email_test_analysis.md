@@ -1,4 +1,4 @@
-# Dec 2018 Email Test: Analysis and Method
+# Sep 2026 Email Test: Analysis and Method
 
 **Question (case brief, p2):** What effect did cutting email volume from 8 to 4 have on the efficacy of our marketing efforts?
 
@@ -29,7 +29,7 @@ All numbers come from `sql/email_test_csv.sql`, which reads only `reference_docs
 | Prospect opportunities | 1,859 |
 | Prospect opportunities found in the CRM file | 1,841 |
 | Not found in the CRM file (counted as unsold) | 18 |
-| CRM opportunities outside the December cohort (out of scope) | 2,261 |
+| CRM opportunities outside the September cohort (out of scope) | 2,261 |
 
 ## Step 2: Was the test run correctly? 
 
@@ -74,7 +74,7 @@ The 4 dropped emails added about 375 visits overall (1,799 vs 1,425).
 ## Limitations and follow-ups
 
 - **Last-visit attribution:** with visit-level data, measure the incremental reach of each dropped email.
-- **Open opportunities:** sales are recorded through 2019-01-18. Check whether opportunities still open would change the sales gap.
+- **Open opportunities:** sales are recorded through 2026-10-19. Check whether opportunities still open would change the sales gap.
 - **The 18 opportunities not found in the CRM file:** confirm with the data owner why they are missing.
 - **Unsubscribes and complaints:** the test was motivated by email fatigue, which this data can't measure. Weigh the 25% sales loss against unsubscribe and complaint rates if they are available.
 - **Segments:** check whether the effect differs by `flow_type`, state or FICO band.
