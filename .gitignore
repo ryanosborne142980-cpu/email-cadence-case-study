@@ -1,0 +1,3 @@
+# DuckDB database: binary, locked by the VS Code DuckDB extension, rebuilt from reference_docs/*.csv
+*.duckdb
+*.duckdb.wal
