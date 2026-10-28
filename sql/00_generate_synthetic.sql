@@ -1,23 +1,23 @@
 -- =====================================================================
 -- Synthetic data generator (SQL Server 2025)
 -- Builds fake prospects and sales_opportunities for the Sep 2026 email
--- cadence test. Built only from aggregate counts and fitted distributions
+-- cadence test. Built only from aggregate shares and fitted distributions
 -- of the original data; no original rows are used.
 --
--- What is exact (so every funnel, z-test and premium result matches the deck):
---   arm sizes, the visited / opp / in-CRM / sold mix per arm, flow_type
---   per arm, last-visit email per arm, disposition counts per arm,
---   home-policy sales per arm, total sold premium per arm.
--- What is sampled (so medians, the bootstrap CI and loss-reason mix
---   outside the cohort move a little): FICO, loan, premium, property
---   fields, dates, states, agents, policy counts.
+-- Every run is a new random data set:
+--   - a fresh random seed (CRYPT_GEN_RANDOM), saved in syn.run
+--   - 80,000-150,000 prospects, split ~50/50 into control and test
+--   - new funnel rates (visit, opt-in, close), scaled so expected buyers are
+--     230-950: the sales-to-prospect ratio changes every run (~0.15%-1.2%)
+--   - each prospect's funnel outcome, segment, email, disposition and premium
+--     drawn at random from those rates and the original data's shares
+-- To repeat a run, paste its seed from syn.run into @seed in STEP 0.
 --
 -- HOW TO RUN (from the repo root)
 --   1. sqlcmd -S .\ROSBO_SQL -E -C -i sql\00_generate_synthetic.sql
 --   2. bcp "SELECT line FROM email_cadence_synth.syn.prospects_csv ORDER BY ord" queryout reference_docs\prospects.csv -c -T -u -S .\ROSBO_SQL
 --   3. bcp "SELECT line FROM email_cadence_synth.syn.sales_opportunities_csv ORDER BY ord" queryout reference_docs\sales_opportunities.csv -c -T -u -S .\ROSBO_SQL
 --   Then run sql\create_tables.sql to load the CSVs, and the analysis scripts.
--- Same seed, same data on every run. Change the seed in syn.h for a new draw.
 -- =====================================================================
 
 IF DB_ID('email_cadence_synth') IS NULL CREATE DATABASE email_cadence_synth;
@@ -29,9 +29,9 @@ GO
 
 
 -- =====================================================================
--- STEP 0. RANDOM NUMBER HELPERS
---   RAND() repeats one value per query and NEWID() can't be reproduced,
---   so every random number is a hash of (seed, purpose, row key).
+-- STEP 0. RUN SEED AND RANDOM NUMBER HELPERS
+--   RAND() repeats one value per query, so every random number is a hash of
+--   (run seed, purpose, row key). A new seed each run gives a new data set.
 -- =====================================================================
 
 -- SCHEMABINDING marks the helpers as pure (no data access), so SQL Server can
@@ -40,11 +40,21 @@ GO
 DROP FUNCTION IF EXISTS syn.lead_uid, syn.z, syn.u, syn.h;
 GO
 
--- 0a. Seeded hash: the only place the seed lives.
-CREATE FUNCTION syn.h(@key VARCHAR(100)) RETURNS VARBINARY(32) WITH SCHEMABINDING AS
+-- 0a. This run's seed: cryptographically random unless @seed is set to repeat a run.
+--     The seed is written into syn.h, the only place it lives, and saved in syn.run.
+DECLARE @seed CHAR(32) = NULL;   -- e.g. '3F9A...' from a previous run's syn.run to reproduce it
+SET @seed = COALESCE(@seed, CONVERT(CHAR(32), CRYPT_GEN_RANDOM(16), 2));
+
+DROP TABLE IF EXISTS syn.run;
+CREATE TABLE syn.run (seed CHAR(32), run_at DATETIME2(0), n_prospects INT, n_orphans INT,
+                      target_buyers FLOAT, visit_rate_c FLOAT, visit_rate_t FLOAT, opt_in_rate FLOAT,
+                      phone_lead_rate FLOAT, close_rate_web FLOAT, close_rate_phone FLOAT);
+INSERT syn.run (seed, run_at) VALUES (@seed, SYSDATETIME());
+
+EXEC (N'CREATE FUNCTION syn.h(@key VARCHAR(100)) RETURNS VARBINARY(32) WITH SCHEMABINDING AS
 BEGIN
-    RETURN HASHBYTES('SHA2_256', CONCAT('seed42|', @key));
-END;
+    RETURN HASHBYTES(''SHA2_256'', CONCAT(''' + @seed + N'|'', @key));
+END;');
 GO
 
 -- 0b. Uniform in (0, 1).
@@ -68,21 +78,43 @@ BEGIN
 END;
 GO
 
+-- 0e. Run size: 80,000-150,000 prospects; orphan CRM opps in the original ratio (2,261 per 89,777).
+UPDATE syn.run SET n_prospects = 80000 + CAST(syn.u('n_prospects') * 70001 AS INT);
+UPDATE syn.run SET n_orphans = ROUND(n_prospects * 2261.0 / 89777, 0);
+
+-- 0f. Funnel rates for this run. Base rates come from the original data:
+--       visit       control 3.99%, test 3.20% (the test effect: 4 emails bring ~20% fewer visits)
+--       opt-in      47% of visitors;  phone / transfer lead 0.39% of non-visitors
+--       in CRM      99% of leads
+--       close       15% of web leads, 25% of phone leads
+--     Base rates give ~0.344% of prospects buying. Each run draws a target of
+--     230-950 buyers and scales the rates by s = target / (prospects x 0.344%):
+--     visit x s^0.5, opt-in x s^0.25, phone lead x s^0.75, close x s^0.25,
+--     so both paths to a sale scale by s and expected buyers hit the target.
+DECLARE @base FLOAT = 0.5 * (0.0399 * 0.47 * 0.99 * 0.15 + (1 - 0.0399) * 0.0039 * 0.99 * 0.25)
+                    + 0.5 * (0.0320 * 0.47 * 0.99 * 0.15 + (1 - 0.0320) * 0.0039 * 0.99 * 0.25);
+UPDATE syn.run SET target_buyers = 230 + syn.u('target_buyers') * 720;
+UPDATE syn.run
+SET visit_rate_c     = 0.0399 * POWER(target_buyers / (n_prospects * @base), 0.5),
+    visit_rate_t     = 0.0320 * POWER(target_buyers / (n_prospects * @base), 0.5),
+    opt_in_rate      = 0.47   * POWER(target_buyers / (n_prospects * @base), 0.25),
+    phone_lead_rate  = 0.0039 * POWER(target_buyers / (n_prospects * @base), 0.75),
+    close_rate_web   = 0.15   * POWER(target_buyers / (n_prospects * @base), 0.25),
+    close_rate_phone = 0.25   * POWER(target_buyers / (n_prospects * @base), 0.25);
+GO
+
 
 -- =====================================================================
--- STEP 1. TARGETS
---   quota  = exact counts. Rows are shuffled within grp and dealt out in order.
---   weight = sampling shares. Each row draws a value in proportion to w.
+-- STEP 1. SHARES
+--   Both tables hold the original data's counts, used as sampling weights:
+--   each row draws a value with probability n / (total n in its dim and grp).
+--   quota  = shares that differ by group (C = control, T = test, I = in cohort, X = outside it).
+--   weight = shares that are the same for everyone.
 -- =====================================================================
 
 DROP TABLE IF EXISTS syn.quota;
 CREATE TABLE syn.quota (dim VARCHAR(20), grp CHAR(1), val VARCHAR(60), n INT);
 INSERT syn.quota VALUES
--- Funnel cell per arm. val = visited | opp | in_crm | sold. 18 opps are missing from the CRM file.
-('cell', 'C', '0000', 43183), ('cell', 'C', '0100', 6), ('cell', 'C', '0110', 119), ('cell', 'C', '0111', 47),
-('cell', 'C', '1000',   955), ('cell', 'C', '1100', 4), ('cell', 'C', '1110', 714), ('cell', 'C', '1111', 130),
-('cell', 'T', '0000', 43025), ('cell', 'T', '0100', 6), ('cell', 'T', '0110', 125), ('cell', 'T', '0111', 33),
-('cell', 'T', '1000',   755), ('cell', 'T', '1100', 2), ('cell', 'T', '1110', 575), ('cell', 'T', '1111', 98),
 -- Flow per arm.
 ('flow', 'C', 'all_funnel', 35372), ('flow', 'C', 'savings', 9786),
 ('flow', 'T', 'all_funnel', 34955), ('flow', 'T', 'savings', 9664),
@@ -156,11 +188,13 @@ INSERT syn.weight VALUES
 ('state', 'SD', 32), ('state', 'DC', 32);
 GO
 
--- Row-number ranges for quotas, probability ranges for weights.
+-- Probability ranges: a uniform draw u picks the value whose [lo, hi) contains it.
 CREATE OR ALTER VIEW syn.quota_range AS
 SELECT dim, grp, val,
-       SUM(n) OVER (PARTITION BY dim, grp ORDER BY val ROWS UNBOUNDED PRECEDING) - n + 1 AS lo,
-       SUM(n) OVER (PARTITION BY dim, grp ORDER BY val ROWS UNBOUNDED PRECEDING)         AS hi
+       CAST(SUM(n) OVER (PARTITION BY dim, grp ORDER BY val ROWS UNBOUNDED PRECEDING) - n AS FLOAT)
+           / SUM(n) OVER (PARTITION BY dim, grp) AS lo,
+       CAST(SUM(n) OVER (PARTITION BY dim, grp ORDER BY val ROWS UNBOUNDED PRECEDING) AS FLOAT)
+           / SUM(n) OVER (PARTITION BY dim, grp) AS hi
 FROM syn.quota;
 GO
 CREATE OR ALTER VIEW syn.weight_range AS
@@ -175,38 +209,47 @@ GO
 -- STEP 2. PROSPECTS
 -- =====================================================================
 
--- 2a. Arm, funnel cell and flow for each of 89,777 prospects.
+-- 2a. Arm (coin flip), funnel and flow for each prospect, drawn at this run's rates (syn.run).
+DECLARE @n_prospects INT, @visit_c FLOAT, @visit_t FLOAT, @opt_in FLOAT, @phone FLOAT, @close_web FLOAT, @close_phone FLOAT;
+SELECT @n_prospects = n_prospects, @visit_c = visit_rate_c, @visit_t = visit_rate_t, @opt_in = opt_in_rate,
+       @phone = phone_lead_rate, @close_web = close_rate_web, @close_phone = close_rate_phone
+FROM syn.run;
+
 DROP TABLE IF EXISTS syn.prospect_cell;
-WITH arm AS (
+WITH arm AS (               -- one uniform draw per prospect per decision
     SELECT value AS n,
-           IIF(ROW_NUMBER() OVER (ORDER BY syn.u(CONCAT('arm|', value)), value) <= 45158, 'C', 'T') AS arm
-    FROM GENERATE_SERIES(1, 89777)
+           IIF(syn.u(CONCAT('arm|', value)) < 0.5, 'C', 'T') AS arm,
+           syn.u(CONCAT('visit|', value))  AS u_visit,
+           syn.u(CONCAT('opp|', value))    AS u_opp,
+           syn.u(CONCAT('crm|', value))    AS u_crm,
+           syn.u(CONCAT('sold|', value))   AS u_sold,
+           syn.u(CONCAT('flow|', value))   AS u_flow
+    FROM GENERATE_SERIES(1, @n_prospects)
 ),
-ranked AS (
-    SELECT n, arm,
-           ROW_NUMBER() OVER (PARTITION BY arm ORDER BY syn.u(CONCAT('cell|', n)), n) AS cell_rn,
-           ROW_NUMBER() OVER (PARTITION BY arm ORDER BY syn.u(CONCAT('flow|', n)), n) AS flow_rn
-    FROM arm
+visit AS (                  -- clicked through to the landing page
+    SELECT *, IIF(u_visit < IIF(arm = 'C', @visit_c, @visit_t), 1, 0) AS visited FROM arm
+),
+lead AS (                   -- opted in on the site, or became a lead by phone without visiting
+    SELECT *, IIF(u_opp < IIF(visited = 1, @opt_in, @phone), 1, 0) AS opp FROM visit
+),
+crm AS (                    -- 1% of leads never reach the CRM file
+    SELECT *, IIF(opp = 1 AND u_crm >= 0.01, 1, 0) AS in_crm FROM lead
 )
-SELECT r.n, r.arm,
-       CAST(SUBSTRING(c.val, 1, 1) AS INT) AS visited,
-       CAST(SUBSTRING(c.val, 2, 1) AS INT) AS opp,
-       CAST(SUBSTRING(c.val, 3, 1) AS INT) AS in_crm,
-       CAST(SUBSTRING(c.val, 4, 1) AS INT) AS sold,
+SELECT r.n, r.arm, r.visited, r.opp, r.in_crm,
+       IIF(r.in_crm = 1 AND r.u_sold < IIF(r.visited = 1, @close_web, @close_phone), 1, 0) AS sold,
        f.val AS flow_type
 INTO syn.prospect_cell
-FROM ranked r
-JOIN syn.quota_range c ON c.dim = 'cell' AND c.grp = r.arm AND r.cell_rn BETWEEN c.lo AND c.hi
-JOIN syn.quota_range f ON f.dim = 'flow' AND f.grp = r.arm AND r.flow_rn BETWEEN f.lo AND f.hi;
+FROM crm r
+JOIN syn.quota_range f ON f.dim = 'flow' AND f.grp = r.arm AND r.u_flow >= f.lo AND r.u_flow < f.hi;
 
 -- 2b. All prospect columns. Distribution parameters are fitted to the original data
 --     (lognormal = mean and sd of ln(value)).
 DROP TABLE IF EXISTS syn.prospect;
 WITH v AS (
     SELECT p.*,
-           ROW_NUMBER() OVER (PARTITION BY p.arm, p.visited ORDER BY syn.u(CONCAT('email|', p.n)), p.n) AS email_rn,
+           syn.u(CONCAT('email|', p.n)) AS u_email,
            -- savings prospects always have a current premium; 55% of all_funnel do
-           IIF(p.flow_type = 'savings' OR syn.u(CONCAT('has_premium|', p.n)) < 38774.0 / 70327, 1, 0) AS has_premium,
+           IIF(p.flow_type = 'savings' OR syn.u(CONCAT('has_premium|', p.n)) < 0.551, 1, 0) AS has_premium,
            syn.u(CONCAT('property_type|', p.n)) AS u_property_type,
            syn.u(CONCAT('residency|', p.n))     AS u_residency,
            syn.u(CONCAT('deductible|', p.n))    AS u_deductible
@@ -215,7 +258,7 @@ WITH v AS (
 SELECT
     1000000 + v.n                                       AS candidate_id,
     3000000 + 2 * v.n + IIF(v.arm = 'C', 1, 0)          AS email_key,      -- odd = control (8 emails), even = test (4)
-    IIF(syn.u(CONCAT('fico_null|', v.n)) < 4.0 / 89777, NULL,
+    IIF(syn.u(CONCAT('fico_null|', v.n)) < 0.00005, NULL,
         CAST(LEAST(850, GREATEST(350, ROUND(731.06 + 59.32 * syn.z(CONCAT('fico|', v.n)), 0))) AS INT)) AS fico_score,
     CAST(GREATEST(5000, ROUND(EXP(11.966 + 0.6705 * syn.z(CONCAT('loan|', v.n))), 0)) AS INT)         AS loan_amount,
     IIF(v.has_premium = 1,
@@ -228,13 +271,13 @@ SELECT
         '{"deductible": null, "dwelling_coverage": null}')                                          AS coverages,
     pt.val                                              AS property_type,
     res.val                                             AS residency_type,
-    IIF(syn.u(CONCAT('year_built_null|', v.n)) < 7832.0 / 89777, NULL,
+    IIF(syn.u(CONCAT('year_built_null|', v.n)) < 0.087, NULL,
         CAST(LEAST(2026, GREATEST(1900, ROUND(1974 + 30 * syn.z(CONCAT('year_built|', v.n)), 0))) AS INT)) AS year_built,
-    IIF(syn.u(CONCAT('purchase_null|', v.n)) < 26215.0 / 89777, NULL,
+    IIF(syn.u(CONCAT('purchase_null|', v.n)) < 0.292, NULL,
         LEAST(CAST('2026-08-31' AS DATE),
               DATEADD(DAY, CAST(syn.u(CONCAT('purchase_day|', v.n)) * 365 AS INT),
                       DATEFROMPARTS(CAST(LEAST(2026, GREATEST(1989, ROUND(2015 + 6 * syn.z(CONCAT('purchase_year|', v.n)), 0))) AS INT), 1, 1)))) AS purchase_date,
-    IIF(syn.u(CONCAT('sqft_null|', v.n)) < 6125.0 / 89777, NULL,
+    IIF(syn.u(CONCAT('sqft_null|', v.n)) < 0.068, NULL,
         CAST(ROUND(EXP(7.4297 + 0.3973 * syn.z(CONCAT('sqft|', v.n))), 0) AS INT))                    AS square_feet,
     CAST(NULL AS VARCHAR(2))                            AS state,          -- empty in the original too
     CAST(NULL AS VARCHAR(5))                            AS zip,
@@ -256,7 +299,7 @@ SELECT
     v.n, v.arm, v.in_crm, v.sold                        -- used to build opportunities; not exported
 INTO syn.prospect
 FROM v
-LEFT JOIN syn.quota_range em  ON em.dim = 'email' AND em.grp = v.arm AND v.visited = 1 AND v.email_rn BETWEEN em.lo AND em.hi
+LEFT JOIN syn.quota_range em  ON em.dim = 'email' AND em.grp = v.arm AND v.visited = 1 AND v.u_email >= em.lo AND v.u_email < em.hi
 JOIN syn.weight_range     pt  ON pt.dim  = 'property_type' AND v.u_property_type >= pt.lo  AND v.u_property_type < pt.hi
 JOIN syn.weight_range     res ON res.dim = 'residency'     AND v.u_residency     >= res.lo AND v.u_residency     < res.hi
 JOIN syn.weight_range     ded ON ded.dim = 'deductible'    AND v.u_deductible    >= ded.lo AND v.u_deductible    < ded.hi;
@@ -266,11 +309,12 @@ JOIN syn.weight_range     ded ON ded.dim = 'deductible'    AND v.u_deductible   
 -- STEP 3. SALES OPPORTUNITIES
 -- =====================================================================
 
--- 3a. One row per opportunity: prospect opps found in the CRM, plus 2,261 orphans.
+-- 3a. One row per opportunity: prospect opps found in the CRM, plus this run's orphans.
+DECLARE @n_orphans INT = (SELECT n_orphans FROM syn.run);
 DROP TABLE IF EXISTS syn.opp_base;
 WITH orphan AS (
-    SELECT value AS n, ROW_NUMBER() OVER (ORDER BY syn.u(CONCAT('orphan_sold|', value)), value) AS sold_rn
-    FROM GENERATE_SERIES(1, 2261)
+    SELECT value AS n, syn.u(CONCAT('orphan_sold|', value)) AS u_sold
+    FROM GENERATE_SERIES(1, @n_orphans)
 )
 SELECT amp_lead_uid, arm AS grp, sold, CONCAT('in|', n) AS k
 INTO syn.opp_base
@@ -279,16 +323,16 @@ WHERE in_crm = 1
 UNION ALL
 SELECT syn.lead_uid(CONCAT('orphan|', o.n)), 'X', CAST(q.val AS INT), CONCAT('orphan|', o.n)
 FROM orphan o
-JOIN syn.quota_range q ON q.dim = 'orphan_sold' AND o.sold_rn BETWEEN q.lo AND q.hi;
+JOIN syn.quota_range q ON q.dim = 'orphan_sold' AND o.u_sold >= q.lo AND o.u_sold < q.hi;
 
--- 3b. Disposition, source / channel and home policy (exact counts).
+-- 3b. Disposition, source / channel and home policy, each drawn at its share.
 DROP TABLE IF EXISTS syn.opp_outcome;
 WITH r AS (
     SELECT b.*,
-           IIF(b.grp = 'X', 'X', 'I') AS src_grp,
-           ROW_NUMBER() OVER (PARTITION BY b.grp, b.sold           ORDER BY syn.u(CONCAT('disp|', b.k)), b.k) AS disp_rn,
-           ROW_NUMBER() OVER (PARTITION BY IIF(b.grp = 'X', 'X', 'I') ORDER BY syn.u(CONCAT('src|', b.k)), b.k)  AS src_rn,
-           ROW_NUMBER() OVER (PARTITION BY b.grp, b.sold           ORDER BY syn.u(CONCAT('home|', b.k)), b.k) AS home_rn
+           IIF(b.grp = 'X', 'X', 'I')     AS src_grp,
+           syn.u(CONCAT('disp|', b.k))    AS u_disp,
+           syn.u(CONCAT('src|', b.k))     AS u_src,
+           syn.u(CONCAT('home|', b.k))    AS u_home
     FROM syn.opp_base b
 )
 SELECT r.amp_lead_uid, r.grp, r.sold, r.k,
@@ -300,32 +344,17 @@ SELECT r.amp_lead_uid, r.grp, r.sold, r.k,
        IIF(h.val = '1', 1, 0)                                          AS home
 INTO syn.opp_outcome
 FROM r
-JOIN syn.quota_range d      ON d.dim = IIF(r.sold = 1, 'disp_sold', 'disp') AND d.grp = r.grp AND r.disp_rn BETWEEN d.lo AND d.hi
-JOIN syn.quota_range s      ON s.dim = 'src' AND s.grp = r.src_grp AND r.src_rn BETWEEN s.lo AND s.hi
-LEFT JOIN syn.quota_range h ON h.dim = 'home' AND h.grp = r.grp AND r.sold = 1 AND r.home_rn BETWEEN h.lo AND h.hi;
+JOIN syn.quota_range d      ON d.dim = IIF(r.sold = 1, 'disp_sold', 'disp') AND d.grp = r.grp AND r.u_disp >= d.lo AND r.u_disp < d.hi
+JOIN syn.quota_range s      ON s.dim = 'src' AND s.grp = r.src_grp AND r.u_src >= s.lo AND r.u_src < s.hi
+LEFT JOIN syn.quota_range h ON h.dim = 'home' AND h.grp = r.grp AND r.sold = 1 AND r.u_home >= h.lo AND r.u_home < h.hi;
 
--- 3c. Premiums. Each arm's sold premium is scaled to its exact original total,
---     and the last sale in each arm absorbs the rounding cents.
+-- 3c. Premiums: one lognormal draw per sale (median ~$1,150).
 DROP TABLE IF EXISTS syn.opp_premium;
-WITH target AS (
-    SELECT * FROM (VALUES ('C', 238628.49), ('T', 177865.58)) t(grp, total)
-),
-raw AS (
-    SELECT o.k, o.grp, EXP(7.045 + 0.538 * syn.z(CONCAT('sold_premium|', o.k))) AS raw_premium,
-           ROW_NUMBER() OVER (PARTITION BY o.grp ORDER BY o.k DESC) AS rn_last
-    FROM syn.opp_outcome o
-    WHERE o.sold = 1
-),
-scaled AS (
-    SELECT raw.k, raw.grp, raw.rn_last, t.total,
-           CAST(ROUND(raw.raw_premium * COALESCE(t.total / SUM(raw.raw_premium) OVER (PARTITION BY raw.grp), 1), 2) AS DECIMAL(10, 2)) AS premium
-    FROM raw
-    LEFT JOIN target t ON t.grp = raw.grp
-)
-SELECT k,
-       premium + IIF(rn_last = 1 AND total IS NOT NULL, total - SUM(premium) OVER (PARTITION BY grp), 0) AS total_sold_premium
+SELECT o.k,
+       CAST(ROUND(EXP(7.045 + 0.538 * syn.z(CONCAT('sold_premium|', o.k))), 2) AS DECIMAL(10, 2)) AS total_sold_premium
 INTO syn.opp_premium
-FROM scaled;
+FROM syn.opp_outcome o
+WHERE o.sold = 1;
 
 -- 3d. All opportunity columns.
 DROP TABLE IF EXISTS syn.opportunity;
@@ -404,10 +433,14 @@ GO
 
 
 -- =====================================================================
--- STEP 5. CHECK: should match the deck exactly.
---   Expect control 45,158 / 1,803 / 1,020 / 177 / $238,628.49
---          test   44,619 / 1,430 /   839 / 131 / $177,865.58
+-- STEP 5. CHECK: this run's seed and size, then the funnel per arm.
+--   Expect 80,000-150,000 prospects, ~50/50 arms, sold near target_buyers
+--   (always within 200-1,000). Numbers and ratios change every run.
 -- =====================================================================
+
+SELECT seed, run_at, n_prospects, n_orphans, ROUND(target_buyers, 0) AS target_buyers,
+       ROUND(100 * target_buyers / n_prospects, 3) AS target_sold_pct
+FROM syn.run;
 
 SELECT p.arm,
        COUNT(*)                                                      AS prospects,

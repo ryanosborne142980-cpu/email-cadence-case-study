@@ -9,6 +9,7 @@ OUTPUT_DIR = "landing"
 # ---------------------------------------------------------------------
 N_PROSPECTS = 90_000
 LIST_DATE = date(2026, 8, 31)           # marketing list exported the day before the first send
+CAMPAIGN_DATE = date(2026, 8, 28)       # campaign set up; dated in utm_campaign codes (sav082826)
 END_DATE = date(2026, 10, 19)           # last CRM snapshot; opps still open then stay open
 
 # Email number -> send date. Control (odd email_key) gets all 8, test (even) gets 4.
